@@ -1,0 +1,32 @@
+# --- data pipeline ---
+pandas
+pyarrow
+kagglehub
+google-play-scraper
+requests
+pymupdf
+tqdm
+
+# --- database ---
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pgvector
+
+# --- embeddings / RAG ---
+sentence-transformers
+ragas
+
+# --- agents / orchestration ---
+langgraph
+langchain
+langchain-google-genai
+pydantic
+
+# --- serving / UI ---
+fastapi
+uvicorn
+streamlit
+
+# --- dev ---
+pytest

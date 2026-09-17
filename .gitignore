@@ -1,0 +1,26 @@
+# Environments
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Data (raw/processed data shouldn't live in git - too large, often regenerable)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/raw/*/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Postgres data volume (if ever bind-mounted locally)
+pgdata/
