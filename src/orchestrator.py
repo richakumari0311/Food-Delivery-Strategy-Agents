@@ -1,11 +1,20 @@
-"""
-Orchestrator (LangGraph) - parallel fan-out / fan-in.
+r"""
+Orchestrator (LangGraph) - full 5-agent graph.
 
-Review Analysis and Data Analyst agents have no dependency on each other
-(different tables, different questions), so they run in PARALLEL as two
-branches from START, then a merge node combines their outputs. This is
-the same pattern the eventual Strategy Agent will use once Segmentation
-and Competitor/Research join in - proving it out now with 2 agents.
+Four independent agents run in PARALLEL from START (no dependency between
+them - different data sources, different question shapes). The Strategy
+Agent is the fan-in point: LangGraph waits for all four parallel branches
+to complete before running it, since it has four incoming edges. No
+separate "merge" node needed - strategy IS the merge, since synthesis is
+its actual job, not just a passthrough.
+
+    START
+   /  |  |  \
+  RA  DA SEG CR      (parallel, no dependency)
+   \  |  |  /
+    strategy          (fan-in: waits for all 4)
+       |
+      END
 
 SETUP:
    pip install langgraph
@@ -14,61 +23,78 @@ RUN (from project root):
    python -m src.orchestrator
 """
 
-import operator
-from typing import Annotated, Optional, TypedDict
+from typing import Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from src.agents.review_analysis import analyze as run_review_analysis
-from src.agents.data_analyst import analyze as run_data_analysis
+from src.agents.review_analysis import analyze as review_analyze
+from src.agents.data_analyst import analyze as data_analyze
+from src.agents.segmentation import run_segmentation
+from src.agents.competitor_research import research as competitor_research
+from src.agents.strategy import synthesize
 
 
 # ---------- Shared graph state ----------
-# Parallel branches write to DIFFERENT keys, so no merge conflicts.
-# (If two parallel nodes ever need to write the SAME key, that key needs
-# an Annotated reducer, e.g. Annotated[list, operator.add] - not needed yet.)
+# Each parallel node writes to its OWN key - no merge conflicts.
+# strategy reads all four once they've landed.
 
 class GraphState(TypedDict):
-    question: str
+    # inputs
+    review_question: str
+    data_question: str
+    competitor_question: str
+    business_question: str
     app_filter: Optional[str]
+
+    # per-agent outputs (written by the 4 parallel nodes)
     review_analysis: Optional[dict]
-    retrieved_review_count: Optional[int]
     data_analysis: Optional[dict]
-    data_analysis_sql: Optional[str]
-    combined_summary: Optional[str]
+    segmentation: Optional[dict]
+    competitor_research: Optional[dict]
+
+    # final output (written by strategy)
+    strategy: Optional[dict]
 
 
 # ---------- Nodes ----------
 
 def review_analysis_node(state: GraphState) -> dict:
-    result, retrieved = run_review_analysis(
-        question=state["question"],
-        app_filter=state.get("app_filter"),
-    )
-    return {
-        "review_analysis": result.model_dump(),
-        "retrieved_review_count": len(retrieved),
-    }
+    result, _ = review_analyze(state["review_question"], app_filter=state.get("app_filter"))
+    return {"review_analysis": result.model_dump()}
 
 
 def data_analyst_node(state: GraphState) -> dict:
-    result, df, sql = run_data_analysis(question=state["question"])
+    result, _, _ = data_analyze(state["data_question"])
+    return {"data_analysis": result.model_dump()}
+
+
+def segmentation_node(state: GraphState) -> dict:
+    persona_set, _ = run_segmentation()
     return {
-        "data_analysis": result.model_dump(),
-        "data_analysis_sql": sql,
+        "segmentation": {
+            "personas": [p.model_dump() for p in persona_set.personas],
+            "note": "Based on KMeans clustering with modest silhouette scores (~0.12) - "
+                    "segments are real but overlapping, on a synthetic dataset.",
+        }
     }
 
 
-def merge_node(state: GraphState) -> dict:
-    """Combine both branches' outputs. No synthesis/reasoning yet - that's
-    the future Strategy Agent's job. This just confirms both branches
-    landed correctly in shared state."""
-    parts = []
-    if state.get("review_analysis"):
-        parts.append(f"[Reviews] {state['review_analysis']['summary']}")
-    if state.get("data_analysis"):
-        parts.append(f"[Orders data] {state['data_analysis']['summary']}")
-    return {"combined_summary": "\n".join(parts)}
+def competitor_research_node(state: GraphState) -> dict:
+    result, _ = competitor_research(state["competitor_question"])
+    return {"competitor_research": result.model_dump()}
+
+
+def strategy_node(state: GraphState) -> dict:
+    """Fan-in point. Runs only after all 4 parallel branches above have
+    written their keys, since it has an incoming edge from each."""
+    inputs = {
+        "review_analysis": state["review_analysis"],
+        "data_analysis": state["data_analysis"],
+        "segmentation": state["segmentation"],
+        "competitor_research": state["competitor_research"],
+    }
+    result = synthesize(state["business_question"], inputs)
+    return {"strategy": result.model_dump()}
 
 
 # ---------- Graph assembly ----------
@@ -77,17 +103,23 @@ def build_graph():
     graph = StateGraph(GraphState)
     graph.add_node("review_analysis", review_analysis_node)
     graph.add_node("data_analyst", data_analyst_node)
-    graph.add_node("merge", merge_node)
+    graph.add_node("segmentation", segmentation_node)
+    graph.add_node("competitor_research", competitor_research_node)
+    graph.add_node("strategy", strategy_node)
 
-    # fan-out: both branches start in parallel from START
+    # fan-out: all 4 start in parallel from START
     graph.add_edge(START, "review_analysis")
     graph.add_edge(START, "data_analyst")
+    graph.add_edge(START, "segmentation")
+    graph.add_edge(START, "competitor_research")
 
-    # fan-in: merge waits for BOTH branches before running
-    graph.add_edge("review_analysis", "merge")
-    graph.add_edge("data_analyst", "merge")
+    # fan-in: strategy waits for ALL 4 branches before running
+    graph.add_edge("review_analysis", "strategy")
+    graph.add_edge("data_analyst", "strategy")
+    graph.add_edge("segmentation", "strategy")
+    graph.add_edge("competitor_research", "strategy")
 
-    graph.add_edge("merge", END)
+    graph.add_edge("strategy", END)
     return graph.compile()
 
 
@@ -95,24 +127,21 @@ if __name__ == "__main__":
     app = build_graph()
 
     initial_state: GraphState = {
-        "question": "What are the most common complaints about delivery time, and which cities have the highest order values?",
+        "review_question": "What are the most common complaints about delivery time and order accuracy?",
+        "data_question": "Which cities have the highest average order value, and how does repeat order rate vary by city?",
+        "competitor_question": "What recent strategic moves have Swiggy and Zomato/Eternal made in the Indian quick-commerce or food delivery space?",
+        "business_question": "What should Swiggy prioritize over the next 1-2 quarters to improve customer retention and competitive position against Zomato/Eternal?",
         "app_filter": "swiggy",
         "review_analysis": None,
-        "retrieved_review_count": None,
         "data_analysis": None,
-        "data_analysis_sql": None,
-        "combined_summary": None,
+        "segmentation": None,
+        "competitor_research": None,
+        "strategy": None,
     }
 
+    print("Running full 5-agent graph (4 parallel branches -> strategy synthesis) ...\n")
     final_state = app.invoke(initial_state)
 
     import json
-    print("--- Review analysis ---")
-    print(json.dumps(final_state["review_analysis"], indent=2))
-
-    print("\n--- Data analysis ---")
-    print(f"SQL used: {final_state['data_analysis_sql']}")
-    print(json.dumps(final_state["data_analysis"], indent=2))
-
-    print("\n--- Combined summary ---")
-    print(final_state["combined_summary"])
+    print("\n--- Final Strategy Output ---")
+    print(json.dumps(final_state["strategy"], indent=2))

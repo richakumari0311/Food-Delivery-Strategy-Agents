@@ -34,7 +34,13 @@ from sklearn.metrics import silhouette_score
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from src.utils.retry import with_llm_retry, with_db_retry
+
 load_dotenv()
+
+# Override in .env, e.g. GEMINI_MODEL=gemini-3.5-flash-lite for a much higher
+# free-tier daily quota (~500/day vs ~20/day) while iterating.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 DB_CONFIG = dict(
     dbname=os.getenv("POSTGRES_DB", "food_delivery"),
@@ -68,6 +74,7 @@ class PersonaSet(BaseModel):
     personas: list[ClusterPersona]
 
 
+@with_db_retry()
 def load_user_features() -> pd.DataFrame:
     conn = psycopg2.connect(**DB_CONFIG)
     try:
@@ -103,8 +110,9 @@ def build_cluster_profiles(df: pd.DataFrame) -> pd.DataFrame:
     return profile
 
 
+@with_llm_retry()
 def generate_personas(profile: pd.DataFrame) -> PersonaSet:
-    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0.3)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.3)
     prompt = (
         "Here are statistical profiles of customer segments from KMeans clustering "
         "on a food delivery app's user base. For EACH cluster_id, give it a short "
@@ -115,6 +123,7 @@ def generate_personas(profile: pd.DataFrame) -> PersonaSet:
     return llm.with_structured_output(PersonaSet).invoke(prompt)
 
 
+@with_db_retry()
 def save_segments(df: pd.DataFrame, persona_map: dict[int, str]):
     df = df[["user_id", "cluster_id"]].copy()
     df["persona_name"] = df["cluster_id"].map(persona_map)

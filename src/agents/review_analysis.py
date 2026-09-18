@@ -29,7 +29,13 @@ from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from src.utils.retry import with_llm_retry, with_db_retry
+
 load_dotenv()
+
+# Override in .env, e.g. GEMINI_MODEL=gemini-3.5-flash-lite for a much higher
+# free-tier daily quota (~500/day vs ~20/day) while iterating.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 DB_CONFIG = dict(
     dbname=os.getenv("POSTGRES_DB", "food_delivery"),
@@ -58,6 +64,16 @@ class ReviewAnalysis(BaseModel):
 
 # ---------- Retrieval ----------
 
+@with_db_retry()
+def _connect_db():
+    return psycopg2.connect(**DB_CONFIG)
+
+
+@with_llm_retry()
+def _invoke_llm(structured_llm, prompt: str) -> "ReviewAnalysis":
+    return structured_llm.invoke(prompt)
+
+
 def retrieve_reviews(conn, embed_model, question: str, app_filter: Optional[str] = None, top_k: int = TOP_K):
     query_vec = embed_model.encode(question, normalize_embeddings=True)
 
@@ -83,7 +99,7 @@ def retrieve_reviews(conn, embed_model, question: str, app_filter: Optional[str]
 # ---------- Agent ----------
 
 def analyze(question: str, app_filter: Optional[str] = None) -> ReviewAnalysis:
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = _connect_db()
     register_vector(conn)
     embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 
@@ -103,7 +119,7 @@ def analyze(question: str, app_filter: Optional[str] = None) -> ReviewAnalysis:
         f"[{r['app']} | {r['rating']}★] {r['text']}" for r in reviews
     )
 
-    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
     structured_llm = llm.with_structured_output(ReviewAnalysis)
 
     prompt = (
@@ -115,7 +131,7 @@ def analyze(question: str, app_filter: Optional[str] = None) -> ReviewAnalysis:
         f"RETRIEVED REVIEWS ({len(reviews)}):\n{reviews_block}"
     )
 
-    result = structured_llm.invoke(prompt)
+    result = _invoke_llm(structured_llm, prompt)
     return result, reviews
 
 

@@ -26,7 +26,13 @@ import psycopg2
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+from src.utils.retry import with_llm_retry, with_db_retry
+
 load_dotenv()
+
+# Override in .env, e.g. GEMINI_MODEL=gemini-3.5-flash-lite for a much higher
+# free-tier daily quota (~500/day vs ~20/day) while iterating.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 DB_CONFIG = dict(
     dbname=os.getenv("POSTGRES_DB", "food_delivery"),
@@ -89,6 +95,7 @@ def validate_sql(sql: str) -> str:
     return sql
 
 
+@with_db_retry()
 def run_query(sql: str) -> pd.DataFrame:
     conn = psycopg2.connect(**DB_CONFIG)
     try:
@@ -102,8 +109,18 @@ def run_query(sql: str) -> pd.DataFrame:
         conn.close()
 
 
+@with_llm_retry()
+def _generate_sql(llm, prompt: str) -> SQLGeneration:
+    return llm.with_structured_output(SQLGeneration).invoke(prompt)
+
+
+@with_llm_retry()
+def _generate_analysis(llm, prompt: str) -> DataAnalysisResult:
+    return llm.with_structured_output(DataAnalysisResult).invoke(prompt)
+
+
 def analyze(question: str):
-    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0)
 
     sql_prompt = (
         "You write PostgreSQL SELECT queries against this schema:\n"
@@ -112,7 +129,7 @@ def analyze(question: str):
         "Write ONE read-only SELECT query that answers it. Prefer aggregates "
         "(GROUP BY, AVG, COUNT) over raw row dumps."
     )
-    sql_gen = llm.with_structured_output(SQLGeneration).invoke(sql_prompt)
+    sql_gen = _generate_sql(llm, sql_prompt)
 
     safe_sql = validate_sql(sql_gen.sql_query)
     print(f"Generated SQL:\n  {safe_sql}\n")
@@ -135,7 +152,7 @@ def analyze(question: str):
         f"{SCHEMA_DESCRIPTION}\n"
         "Answer the question using ONLY these results. Cite actual numbers."
     )
-    result = llm.with_structured_output(DataAnalysisResult).invoke(analysis_prompt)
+    result = _generate_analysis(llm, analysis_prompt)
 
     return result, df, safe_sql
 
