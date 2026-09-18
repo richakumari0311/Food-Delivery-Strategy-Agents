@@ -8,7 +8,7 @@ SETUP:
    pip install sentence-transformers pgvector psycopg2-binary python-dotenv
 
 RUN:
-   python scripts/07_generate_embeddings.py
+   python 07_generate_embeddings.py
 
 NOTE: uses all-MiniLM-L6-v2 (384 dims, matches schema.sql). If you switch
 models later, you'll need to change the `vector(384)` column width in
@@ -30,6 +30,7 @@ DB_CONFIG = dict(
     password=os.getenv("POSTGRES_PASSWORD", "app_password"),
     host=os.getenv("POSTGRES_HOST", "localhost"),
     port=os.getenv("POSTGRES_PORT", "5432"),
+    sslmode=os.getenv("POSTGRES_SSLMODE", "prefer"),
 )
 
 MODEL_NAME = "all-MiniLM-L6-v2"

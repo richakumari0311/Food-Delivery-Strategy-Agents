@@ -7,7 +7,7 @@ SETUP:
    3. pip install sqlalchemy psycopg2-binary python-dotenv pandas
 
 RUN:
-   python scripts/06_load_to_postgres.py
+   python 06_load_to_postgres.py
 """
 
 import os
@@ -22,10 +22,12 @@ load_dotenv()
 DB_USER = os.getenv("POSTGRES_USER", "app")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "app_password")
 DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
-DB_PORT = os.getenv("POSTGRES_PORT", "5432")
+DB_PORT = os.getenv("POSTGRES_PORT", "5433")
 DB_NAME = os.getenv("POSTGRES_DB", "food_delivery")
 
-DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DB_SSLMODE = os.getenv("POSTGRES_SSLMODE", "prefer")
+
+DB_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?sslmode={DB_SSLMODE}"
 
 SCHEMA_FILE = Path("schema.sql")
 

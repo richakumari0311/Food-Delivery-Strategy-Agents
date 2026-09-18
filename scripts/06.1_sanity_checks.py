@@ -1,9 +1,9 @@
 """
-Step 6.1: Quick sanity checks on the loaded Postgres data - joins, aggregates,
+Step 6b: Quick sanity checks on the loaded Postgres data - joins, aggregates,
 and spot checks across all 4 tables before we build embeddings/agents on top.
 
 RUN:
-   python scripts/06.1_sanity_checks.py
+   python 06b_sanity_checks.py
 """
 
 import os
@@ -20,6 +20,7 @@ DB_URL = (
     f"{os.getenv('POSTGRES_HOST', 'localhost')}:"
     f"{os.getenv('POSTGRES_PORT', '5432')}/"
     f"{os.getenv('POSTGRES_DB', 'food_delivery')}"
+    f"?sslmode={os.getenv('POSTGRES_SSLMODE', 'prefer')}"
 )
 
 CHECKS = [

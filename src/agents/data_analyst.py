@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from src.utils.retry import with_llm_retry, with_db_retry
+from src.utils.db import get_db_config
 
 load_dotenv()
 
@@ -34,13 +35,7 @@ load_dotenv()
 # free-tier daily quota (~500/day vs ~20/day) while iterating.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
-DB_CONFIG = dict(
-    dbname=os.getenv("POSTGRES_DB", "food_delivery"),
-    user=os.getenv("POSTGRES_USER", "app"),
-    password=os.getenv("POSTGRES_PASSWORD", "app_password"),
-    host=os.getenv("POSTGRES_HOST", "localhost"),
-    port=os.getenv("POSTGRES_PORT", "5432"),
-)
+DB_CONFIG = get_db_config()
 
 MAX_ROWS = 200
 
