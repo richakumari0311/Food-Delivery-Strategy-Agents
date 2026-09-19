@@ -61,7 +61,17 @@ class ReviewAnalysis(BaseModel):
 
 @with_db_retry()
 def _connect_db():
-    return psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(**DB_CONFIG)
+    # Explicitly set search_path on this connection rather than relying on
+    # ALTER DATABASE ... SET search_path - Supabase's connection pooler
+    # (PgBouncer) can reuse backend sessions in ways that don't reliably
+    # pick up database-level defaults. pgvector lives in the `extensions`
+    # schema on Supabase (vs `public` on local Docker Postgres), so
+    # register_vector() needs it on the path explicitly, every connection.
+    with conn.cursor() as cur:
+        cur.execute("SET search_path TO public, extensions;")
+    conn.commit()
+    return conn
 
 
 @with_llm_retry()

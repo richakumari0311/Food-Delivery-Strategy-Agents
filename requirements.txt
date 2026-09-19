@@ -1,32 +1,15 @@
-# --- data pipeline ---
+streamlit
+plotly
 pandas
 pyarrow
-kagglehub
-google-play-scraper
-requests
-pymupdf
-tqdm
-
-# --- database ---
 sqlalchemy
 psycopg2-binary
 python-dotenv
-pgvector
-
-# --- embeddings / RAG ---
 sentence-transformers
-ragas
-
-# --- agents / orchestration ---
+pgvector
+scikit-learn
 langgraph
-langchain
 langchain-google-genai
+google-genai
+tavily-python
 pydantic
-
-# --- serving / UI ---
-fastapi
-uvicorn
-streamlit
-
-# --- dev ---
-pytest

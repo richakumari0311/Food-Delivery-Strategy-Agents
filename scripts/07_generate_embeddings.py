@@ -8,7 +8,7 @@ SETUP:
    pip install sentence-transformers pgvector psycopg2-binary python-dotenv
 
 RUN:
-   python 07_generate_embeddings.py
+   python scripts/07_generate_embeddings.py
 
 NOTE: uses all-MiniLM-L6-v2 (384 dims, matches schema.sql). If you switch
 models later, you'll need to change the `vector(384)` column width in

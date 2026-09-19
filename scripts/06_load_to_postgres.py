@@ -7,7 +7,7 @@ SETUP:
    3. pip install sqlalchemy psycopg2-binary python-dotenv pandas
 
 RUN:
-   python 06_load_to_postgres.py
+   python scripts/06_load_to_postgres.py
 """
 
 import os

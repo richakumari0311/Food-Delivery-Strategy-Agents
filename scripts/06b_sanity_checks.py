@@ -3,7 +3,7 @@ Step 6b: Quick sanity checks on the loaded Postgres data - joins, aggregates,
 and spot checks across all 4 tables before we build embeddings/agents on top.
 
 RUN:
-   python 06b_sanity_checks.py
+   python scripts/06b_sanity_checks.py
 """
 
 import os
