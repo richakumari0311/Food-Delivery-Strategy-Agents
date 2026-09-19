@@ -19,7 +19,7 @@ SETUP:
    pip install scikit-learn langchain-google-genai pydantic psycopg2-binary python-dotenv pandas
 
 RUN:
-   python agents/segmentation_agent.py
+   python -m src.agents.segmentation
 """
 
 import os
@@ -113,6 +113,11 @@ def generate_personas(profile: pd.DataFrame) -> PersonaSet:
         "on a food delivery app's user base. For EACH cluster_id, give it a short "
         "persona name and description based ONLY on these aggregated stats - do not "
         "invent details not implied by the numbers.\n\n"
+        "Naming style: these will appear in a business strategy report for executives, "
+        "not a consumer marketing deck. Use formal, analytical language (e.g. 'High-Value "
+        "Repeat Customers', 'Price-Sensitive Occasional Users') rather than casual or "
+        "playful phrasing (avoid terms like 'Hunters', 'Splurgers', or slang). Keep each "
+        "name to 2-4 words.\n\n"
         f"{profile.to_string(index=False)}"
     )
     return llm.with_structured_output(PersonaSet).invoke(prompt)

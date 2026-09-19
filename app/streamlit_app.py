@@ -24,6 +24,13 @@ from pathlib import Path
 
 import streamlit as st
 
+st.set_page_config(
+    page_title="Food Delivery Agent Insights",
+    page_icon="📈",
+    layout="wide",
+    menu_items={"Get help": None, "Report a bug": None, "About": None},
+)
+
 # --- Bridge Streamlit secrets -> environment variables ---
 # Must happen BEFORE importing anything from src/, since several modules
 # read os.getenv(...) at import time (e.g. GEMINI_MODEL constants).
@@ -38,6 +45,17 @@ for _key in [
 # Make `src` importable when run as `streamlit run app/streamlit_app.py`
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+_REQUIRED_SECRETS = ["POSTGRES_HOST", "POSTGRES_PASSWORD", "GEMINI_API_KEY", "TAVILY_API_KEY"]
+_missing = [k for k in _REQUIRED_SECRETS if not os.getenv(k)]
+if _missing:
+    st.error(
+        "This app is missing required configuration and cannot start.\n\n"
+        f"Missing: {', '.join(_missing)}\n\n"
+        "If you're the app owner, set these in Streamlit Cloud under "
+        "Settings > Secrets, or in a local .streamlit/secrets.toml file."
+    )
+    st.stop()
+
 import pandas as pd
 import plotly.express as px
 from sqlalchemy import create_engine, text
@@ -45,11 +63,9 @@ from sqlalchemy import create_engine, text
 from src.utils.db import get_db_url
 from src.utils.rate_limit import check_and_increment, get_current_count
 
-st.set_page_config(page_title="Food Delivery Agent Insights", page_icon="📈", layout="wide")
-
 # ---------- Design tokens (kept in one place so the palette stays consistent) ----------
 
-COLOR_BG = "#0B0B0B"
+COLOR_BG = "#FAFAFA"
 COLOR_SURFACE = "#FFFFFF"
 COLOR_TEXT = "#1A1D29"
 COLOR_MUTED = "#6B7280"
@@ -77,6 +93,10 @@ h1, h2, h3, .kpi-value {{
 }}
 [data-testid="stMetricLabel"] {{
     color: {COLOR_MUTED};
+}}
+.block-container {{
+    padding-top: 2rem;
+    padding-bottom: 2rem;
 }}
 .stTabs [data-baseweb="tab"] {{
     font-weight: 500;
@@ -112,8 +132,9 @@ h1, h2, h3, .kpi-value {{
     font-size: 1rem;
     margin-top: -0.5rem;
 }}
-#MainMenu {{visibility: visible;}}
+#MainMenu {{visibility: hidden;}}
 footer {{visibility: hidden;}}
+[data-testid="stToolbar"] {{visibility: hidden;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -203,6 +224,17 @@ def cached_strategy(business_question: str, review_q: str, data_q: str, competit
     return result.model_dump(), inputs
 
 
+def show_friendly_error(exc: Exception):
+    """Public-facing error message. Doesn't leak internal details (DB
+    hosts, SQL, API error bodies) to visitors - just the failure type."""
+    st.error(
+        "Something went wrong processing this request. This is usually "
+        "temporary (a busy API or a momentary connection issue). Please "
+        "try again in a moment."
+    )
+    st.caption(f"Error type: {type(exc).__name__}")
+
+
 def render_recommendation_card(rec: dict):
     color = PRIORITY_COLORS.get(rec["priority"], COLOR_MUTED)
     evidence_html = "".join(f'<div class="evidence-item">- {e}</div>' for e in rec["supporting_evidence"])
@@ -221,15 +253,14 @@ def render_recommendation_card(rec: dict):
 with st.sidebar:
     st.markdown("### Market Intelligence")
     st.caption("Swiggy vs. Zomato/Eternal competitive analysis")
-    st.divider()
-    st.markdown("**Today's usage**")
-    st.progress(min(get_current_count("agent_query") / AGENT_QUERY_DAILY_LIMIT, 1.0),
-                text=f"Agent queries: {get_current_count('agent_query')}/{AGENT_QUERY_DAILY_LIMIT}")
-    st.progress(min(get_current_count("strategy_run") / STRATEGY_RUN_DAILY_LIMIT, 1.0),
-                text=f"Strategy runs: {get_current_count('strategy_run')}/{STRATEGY_RUN_DAILY_LIMIT}")
-    st.divider()
-    st.caption("5 specialized agents: Review Analysis, Data Analyst, "
-               "Consumer Segmentation, Competitor Research, and Strategy.")
+    st.caption("5 agents: Review Analysis, Data Analyst, Consumer Segmentation, "
+               "Competitor Research, Strategy.")
+
+    with st.expander("Usage today", expanded=False):
+        aq = get_current_count("agent_query")
+        sr = get_current_count("strategy_run")
+        st.caption(f"Agent queries: {aq}/{AGENT_QUERY_DAILY_LIMIT}")
+        st.caption(f"Strategy runs: {sr}/{STRATEGY_RUN_DAILY_LIMIT}")
 
 
 # ---------- Main ----------
@@ -237,21 +268,26 @@ with st.sidebar:
 st.title("Food Delivery Multi-Agent Insights")
 st.markdown('<p class="app-subtitle">Real reviews, order data, and live market research, synthesized by 5 AI agents</p>',
             unsafe_allow_html=True)
-st.write("")
 
 tab_dashboard, tab_agents, tab_strategy, tab_about = st.tabs(
     ["Dashboard", "Ask an Agent", "Full Strategy", "About"]
 )
 
 with tab_dashboard:
-    kpis = load_kpis()
+    try:
+        kpis = load_kpis()
+    except Exception as e:
+        st.error("Could not load dashboard data right now. Please try again shortly.")
+        st.caption(f"Error type: {type(e).__name__}")
+        st.stop()
+
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total Orders", f"{kpis['total_orders']:,}")
     k2.metric("Unique Users", f"{kpis['total_users']:,}")
     k3.metric("Avg Order Value", f"₹{kpis['avg_order_value']:,.0f}")
     k4.metric("Repeat Order Rate", f"{kpis['repeat_pct']}%")
 
-    st.write("")
+    st.divider()
     st.subheader("Order data by city")
     city_df = load_city_stats()
     col1, col2 = st.columns(2)
@@ -271,6 +307,7 @@ with tab_dashboard:
     with st.expander("View raw city data"):
         st.dataframe(city_df, use_container_width=True)
 
+    st.divider()
     st.subheader("Review rating distribution")
     review_df = load_review_rating_dist()
     if not review_df.empty:
@@ -280,6 +317,7 @@ with tab_dashboard:
                            font_color=COLOR_TEXT, margin=dict(t=20, l=0, r=0, b=0))
         st.plotly_chart(fig, use_container_width=True)
 
+    st.divider()
     st.subheader("Consumer segments")
     seg_df = load_segments()
     if not seg_df.empty:
@@ -304,13 +342,20 @@ with tab_agents:
     if agent_choice == "Review Analysis":
         question = st.text_input("Your question about app reviews", "What do users complain about most?")
         app_filter = st.selectbox("App", ["", "swiggy", "zomato"], format_func=lambda x: x or "Both apps")
-        if st.button("Ask Review Analysis Agent", type="primary"):
+        asked = st.button("Ask Review Analysis Agent", type="primary")
+        if not asked:
+            st.caption("Try: \"What do people say about delivery speed?\" or \"Are customers happy with order accuracy?\"")
+        if asked:
             allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
             if not allowed:
                 st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
             else:
-                with st.spinner("Retrieving reviews and analyzing..."):
-                    result, n_reviews = cached_review_analysis(question, app_filter)
+                try:
+                    with st.spinner("Retrieving reviews and analyzing..."):
+                        result, n_reviews = cached_review_analysis(question, app_filter)
+                except Exception as e:
+                    show_friendly_error(e)
+                    st.stop()
                 with st.chat_message("assistant"):
                     st.caption(f"Based on {n_reviews} retrieved reviews")
                     st.write(result["summary"])
@@ -322,13 +367,20 @@ with tab_agents:
 
     elif agent_choice == "Data Analyst":
         question = st.text_input("Your question about order data", "Which cities have the highest order values?")
-        if st.button("Ask Data Analyst Agent", type="primary"):
+        asked = st.button("Ask Data Analyst Agent", type="primary")
+        if not asked:
+            st.caption("Try: \"What's the average spend per city?\" or \"How does repeat rate vary by age group?\"")
+        if asked:
             allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
             if not allowed:
                 st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
             else:
-                with st.spinner("Generating SQL and analyzing..."):
-                    result, sql, rows = cached_data_analysis(question)
+                try:
+                    with st.spinner("Generating SQL and analyzing..."):
+                        result, sql, rows = cached_data_analysis(question)
+                except Exception as e:
+                    show_friendly_error(e)
+                    st.stop()
                 with st.chat_message("assistant"):
                     st.code(sql, language="sql")
                     st.write(result["summary"])
@@ -342,13 +394,20 @@ with tab_agents:
             "Your question about the market",
             "What recent moves have Swiggy and Zomato made in quick commerce?",
         )
-        if st.button("Ask Competitor Research Agent", type="primary"):
+        asked = st.button("Ask Competitor Research Agent", type="primary")
+        if not asked:
+            st.caption("Try: \"How is Blinkit performing against Instamart?\" or \"What's the latest on Eternal's profitability?\"")
+        if asked:
             allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
             if not allowed:
                 st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
             else:
-                with st.spinner("Searching the web and analyzing..."):
-                    result = cached_competitor_research(question)
+                try:
+                    with st.spinner("Searching the web and analyzing..."):
+                        result = cached_competitor_research(question)
+                except Exception as e:
+                    show_friendly_error(e)
+                    st.stop()
                 with st.chat_message("assistant"):
                     st.write(result["summary"])
                     for f in result["key_findings"]:
@@ -371,18 +430,31 @@ with tab_strategy:
         "customer retention and competitive position against Zomato/Eternal?",
     )
 
-    if st.button("Run Full Strategy Analysis", type="primary"):
+    run_clicked = st.button("Run Full Strategy Analysis", type="primary")
+
+    if not run_clicked:
+        st.caption(
+            "Runs Review Analysis, Data Analyst, Consumer Segmentation, and "
+            "Competitor Research in parallel, then synthesizes prioritized, "
+            "evidence-cited recommendations. Takes about a minute."
+        )
+
+    if run_clicked:
         allowed, count = check_and_increment("strategy_run", STRATEGY_RUN_DAILY_LIMIT)
         if not allowed:
             st.error(f"Daily strategy-run limit reached ({STRATEGY_RUN_DAILY_LIMIT}/day). Try again tomorrow.")
         else:
-            with st.spinner("Running all 5 agents, this takes a minute..."):
-                result, inputs = cached_strategy(
-                    business_q,
-                    review_q="What are the most common complaints about delivery time and order accuracy?",
-                    data_q="Which cities have the highest average order value, and how does repeat order rate vary by city?",
-                    competitor_q="What recent strategic moves have Swiggy and Zomato/Eternal made in the Indian quick-commerce or food delivery space?",
-                )
+            try:
+                with st.spinner("Running all 5 agents, this takes a minute..."):
+                    result, inputs = cached_strategy(
+                        business_q,
+                        review_q="What are the most common complaints about delivery time and order accuracy?",
+                        data_q="Which cities have the highest average order value, and how does repeat order rate vary by city?",
+                        competitor_q="What recent strategic moves have Swiggy and Zomato/Eternal made in the Indian quick-commerce or food delivery space?",
+                    )
+            except Exception as e:
+                show_friendly_error(e)
+                st.stop()
 
             st.subheader("Executive Summary")
             st.write(result["executive_summary"])
@@ -403,15 +475,13 @@ with tab_about:
     with a1:
         st.markdown("""
 This project analyzes Swiggy and Zomato/Eternal's position in the Indian food
-delivery and quick-commerce market using 5 specialized AI agents:
+delivery and quick commerce market using 5 specialized AI agents:
 
-- **Review Analysis** - RAG over real Play Store reviews
-- **Data Analyst** - text-to-SQL over order data, with read-only guardrails
-- **Consumer Segmentation** - KMeans clustering with LLM-generated personas
-- **Competitor Research** - live web search via Tavily
-- **Strategy** - synthesizes the other four, weighting real data above synthetic data
-
-Full source and documentation: [GitHub repo link here]
+- **Review Analysis**: RAG over real Play Store reviews
+- **Data Analyst**: text-to-SQL over order data, with read-only guardrails
+- **Consumer Segmentation**: KMeans clustering with LLM-generated personas
+- **Competitor Research**: live web search via Tavily
+- **Strategy**: synthesizes the other four, weighting real data above synthetic data
         """)
     with a2:
         st.metric("Agents", "5")
