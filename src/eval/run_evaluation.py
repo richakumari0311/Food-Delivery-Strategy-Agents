@@ -3,6 +3,7 @@
 import os
 import sys
 import types
+from typing import Any
 
 # Ragas compatibility shim.
 try:
@@ -56,7 +57,7 @@ except (AttributeError, TypeError):
     pass
 
 
-def get_judge_llm() -> LangchainLLMWrapper:
+def get_judge_llm() -> Any:
     """Create the LLM used by Ragas as the evaluation judge."""
     llm = ChatGoogleGenerativeAI(
         model=GEMINI_MODEL,
@@ -196,7 +197,7 @@ def get_run_config():
 def run_eval(
     agent_name: str,
     dataset: Dataset,
-    judge_llm: LangchainLLMWrapper,
+    judge_llm: Any,
     judge_embeddings,
 ) -> None:
     """Evaluate one agent dataset and persist detailed scores."""
