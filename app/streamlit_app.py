@@ -10,9 +10,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Food Delivery Agent Insights",
@@ -47,9 +45,7 @@ ENV_KEYS = [
 AGENT_QUERY_DAILY_LIMIT = 30
 STRATEGY_RUN_DAILY_LIMIT = 5
 
-# ---------------------------------------------------------------------------
 # Theme
-# ---------------------------------------------------------------------------
 
 COLOR_BG = "#FAFAFA"
 COLOR_SURFACE = "#FFFFFF"
@@ -75,9 +71,7 @@ CHART_SEQUENCE = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # Environment setup
-# ---------------------------------------------------------------------------
 
 for key in ENV_KEYS:
     if key in st.secrets:
@@ -105,9 +99,7 @@ from src.utils.db import get_db_url
 from src.utils.rate_limit import check_and_increment, get_current_count
 
 
-# ---------------------------------------------------------------------------
 # Styling
-# ---------------------------------------------------------------------------
 
 st.markdown(
     f"""
@@ -197,9 +189,7 @@ st.markdown(
 )
 
 
-# ---------------------------------------------------------------------------
 # Database access
-# ---------------------------------------------------------------------------
 
 
 @st.cache_resource
@@ -304,9 +294,7 @@ def load_segments() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
 # LLM-backed analysis
-# ---------------------------------------------------------------------------
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -353,24 +341,30 @@ def cached_strategy(
     review_question: str,
     data_question: str,
     competitor_question: str,
-) -> tuple[dict, object]:
-    """Run and cache the complete strategy analysis."""
-    from src.agents.strategy import gather_inputs, synthesize
+) -> tuple[dict, dict]:
+    """Run and cache the complete strategy analysis using LangGraph."""
+    from src.orchestrator import build_graph
 
-    inputs = gather_inputs(
-        review_question,
-        data_question,
-        competitor_question,
-    )
-    result = synthesize(business_question, inputs)
+    app = build_graph()
 
-    return result.model_dump(), inputs
+    initial_state = {
+        "review_question": review_question,
+        "data_question": data_question,
+        "competitor_question": competitor_question,
+        "business_question": business_question,
+        "app_filter": None,
+        "review_analysis": None,
+        "data_analysis": None,
+        "segmentation": None,
+        "competitor_research": None,
+        "strategy": None,
+    }
 
+    final_state = app.invoke(initial_state)
 
-# ---------------------------------------------------------------------------
+    return final_state["strategy"], final_state
+
 # UI helpers
-# ---------------------------------------------------------------------------
-
 
 def show_friendly_error(exc: Exception) -> None:
     """Display a safe public-facing error message."""
@@ -424,9 +418,7 @@ def check_usage_limit(
     return allowed
 
 
-# ---------------------------------------------------------------------------
 # Sidebar
-# ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown("### Market Intelligence")
@@ -448,9 +440,7 @@ with st.sidebar:
         )
 
 
-# ---------------------------------------------------------------------------
 # Main application
-# ---------------------------------------------------------------------------
 
 st.title("Food Delivery Multi-Agent Insights")
 st.markdown(
@@ -466,9 +456,7 @@ tab_dashboard, tab_agents, tab_strategy, tab_about = st.tabs(
 )
 
 
-# ---------------------------------------------------------------------------
 # Dashboard
-# ---------------------------------------------------------------------------
 
 with tab_dashboard:
     try:
@@ -580,9 +568,7 @@ with tab_dashboard:
         )
 
 
-# ---------------------------------------------------------------------------
 # Agent queries
-# ---------------------------------------------------------------------------
 
 with tab_agents:
     st.write(
@@ -720,9 +706,7 @@ with tab_agents:
                         st.write(f"- {source}")
 
 
-# ---------------------------------------------------------------------------
 # Full strategy
-# ---------------------------------------------------------------------------
 
 with tab_strategy:
     st.write(
@@ -790,9 +774,7 @@ with tab_strategy:
             st.info(result["confidence_note"])
 
 
-# ---------------------------------------------------------------------------
 # About
-# ---------------------------------------------------------------------------
 
 with tab_about:
     about_col, metrics_col = st.columns([2, 1])
