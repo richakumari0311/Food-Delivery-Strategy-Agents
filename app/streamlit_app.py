@@ -1,287 +1,488 @@
-"""
-Streamlit app for the Food Delivery Multi-Agent Insights project.
-
-Two kinds of content, deliberately separated:
-  1. Dashboard tab: direct DB queries only, no LLM calls. Always available,
-     free to load repeatedly, safe for any amount of traffic.
-  2. Ask an Agent / Full Strategy tabs: real LLM calls. Gated by a
-     DB-backed daily usage counter (src/utils/rate_limit.py) so public
-     traffic can't silently exhaust the shared Gemini quota.
-
-SETUP (local):
-   pip install streamlit plotly
-   streamlit run app/streamlit_app.py
-
-DEPLOY: push to GitHub, then on share.streamlit.io point at this file.
-Set secrets in the Streamlit Cloud dashboard (see .streamlit/secrets.toml.example).
-The visual theme lives in .streamlit/config.toml (colors/font) plus the
-CSS block below (typography import, card styling, priority color-coding).
-"""
+"""Streamlit dashboard for the Food Delivery Multi-Agent Insights project."""
 
 import os
 import sys
 from pathlib import Path
 
+import pandas as pd
+import plotly.express as px
 import streamlit as st
+from sqlalchemy import create_engine, text
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="Food Delivery Agent Insights",
     page_icon="📈",
     layout="wide",
-    menu_items={"Get help": None, "Report a bug": None, "About": None},
+    menu_items={
+        "Get help": None,
+        "Report a bug": None,
+        "About": None,
+    },
 )
 
-# --- Bridge Streamlit secrets -> environment variables ---
-# Must happen BEFORE importing anything from src/, since several modules
-# read os.getenv(...) at import time (e.g. GEMINI_MODEL constants).
-for _key in [
-    "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USER", "POSTGRES_PASSWORD",
-    "POSTGRES_DB", "POSTGRES_SSLMODE", "GEMINI_API_KEY", "GEMINI_MODEL",
+REQUIRED_SECRETS = [
+    "POSTGRES_HOST",
+    "POSTGRES_PASSWORD",
+    "GEMINI_API_KEY",
     "TAVILY_API_KEY",
-]:
-    if _key in st.secrets:
-        os.environ[_key] = str(st.secrets[_key])
+]
 
-# Make `src` importable when run as `streamlit run app/streamlit_app.py`
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+ENV_KEYS = [
+    "POSTGRES_HOST",
+    "POSTGRES_PORT",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_DB",
+    "POSTGRES_SSLMODE",
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "TAVILY_API_KEY",
+]
 
-_REQUIRED_SECRETS = ["POSTGRES_HOST", "POSTGRES_PASSWORD", "GEMINI_API_KEY", "TAVILY_API_KEY"]
-_missing = [k for k in _REQUIRED_SECRETS if not os.getenv(k)]
-if _missing:
-    st.error(
-        "This app is missing required configuration and cannot start.\n\n"
-        f"Missing: {', '.join(_missing)}\n\n"
-        "If you're the app owner, set these in Streamlit Cloud under "
-        "Settings > Secrets, or in a local .streamlit/secrets.toml file."
-    )
-    st.stop()
+AGENT_QUERY_DAILY_LIMIT = 30
+STRATEGY_RUN_DAILY_LIMIT = 5
 
-import pandas as pd
-import plotly.express as px
-from sqlalchemy import create_engine, text
-
-from src.utils.db import get_db_url
-from src.utils.rate_limit import check_and_increment, get_current_count
-
-# ---------- Design tokens (kept in one place so the palette stays consistent) ----------
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
 
 COLOR_BG = "#FAFAFA"
 COLOR_SURFACE = "#FFFFFF"
 COLOR_TEXT = "#1A1D29"
 COLOR_MUTED = "#6B7280"
-COLOR_ACCENT = "#E8A33D"      # saffron - primary actions, medium priority
-COLOR_HIGH = "#C1442E"        # terracotta-red - high priority / urgent
-COLOR_LOW = "#1F6F6F"         # deep teal - low priority / secondary
-PRIORITY_COLORS = {"high": COLOR_HIGH, "medium": COLOR_ACCENT, "low": COLOR_LOW}
-CHART_SEQUENCE = [COLOR_ACCENT, COLOR_LOW, COLOR_HIGH, "#4A5568", "#8B6F47", "#2D5F5D"]
+COLOR_ACCENT = "#E8A33D"
+COLOR_HIGH = "#C1442E"
+COLOR_LOW = "#1F6F6F"
 
-st.markdown(f"""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700&family=Inter:wght@400;500;600&display=swap');
+PRIORITY_COLORS = {
+    "high": COLOR_HIGH,
+    "medium": COLOR_ACCENT,
+    "low": COLOR_LOW,
+}
 
-html, body, [class*="css"] {{
-    font-family: 'Inter', sans-serif;
-    color: {COLOR_TEXT};
-}}
-h1, h2, h3, .kpi-value {{
-    font-family: 'Sora', sans-serif !important;
-    letter-spacing: -0.01em;
-}}
-[data-testid="stMetricValue"] {{
-    font-family: 'Sora', sans-serif;
-    color: {COLOR_TEXT};
-}}
-[data-testid="stMetricLabel"] {{
-    color: {COLOR_MUTED};
-}}
-.block-container {{
-    padding-top: 2rem;
-    padding-bottom: 2rem;
-}}
-.stTabs [data-baseweb="tab"] {{
-    font-weight: 500;
-}}
-.rec-card {{
-    background: {COLOR_SURFACE};
-    border-left: 4px solid var(--rec-color);
-    border-radius: 4px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 0.75rem;
-    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-}}
-.rec-title {{
-    font-family: 'Sora', sans-serif;
-    font-weight: 600;
-    font-size: 1.05rem;
-    margin-bottom: 0.25rem;
-}}
-.rec-priority {{
-    display: inline-block;
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: var(--rec-color);
-    margin-bottom: 0.4rem;
-}}
-.evidence-item {{
-    color: {COLOR_MUTED};
-    font-size: 0.9rem;
-    margin: 0.15rem 0;
-}}
-.app-subtitle {{
-    color: {COLOR_MUTED};
-    font-size: 1rem;
-    margin-top: -0.5rem;
-}}
-#MainMenu {{visibility: hidden;}}
-footer {{visibility: hidden;}}
-[data-testid="stToolbar"] {{visibility: hidden;}}
-</style>
-""", unsafe_allow_html=True)
-
-# Daily caps - tuned to a Flash-Lite-class quota (~500/day). Lower these if
-# you're on a model with the ~20/day free tier.
-AGENT_QUERY_DAILY_LIMIT = 30
-STRATEGY_RUN_DAILY_LIMIT = 5
+CHART_SEQUENCE = [
+    COLOR_ACCENT,
+    COLOR_LOW,
+    COLOR_HIGH,
+    "#4A5568",
+    "#8B6F47",
+    "#2D5F5D",
+]
 
 
-# ---------- Data access (cached, no LLM calls) ----------
+# ---------------------------------------------------------------------------
+# Environment setup
+# ---------------------------------------------------------------------------
+
+for key in ENV_KEYS:
+    if key in st.secrets:
+        os.environ[key] = str(st.secrets[key])
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+missing_secrets = [key for key in REQUIRED_SECRETS if not os.getenv(key)]
+
+if missing_secrets:
+    st.error(
+        "This app is missing required configuration and cannot start.\n\n"
+        f"Missing: {', '.join(missing_secrets)}\n\n"
+        "Set these values in Streamlit Cloud under Settings > Secrets "
+        "or in a local .streamlit/secrets.toml file."
+    )
+    st.stop()
+
+
+# Local imports must happen after environment configuration.
+from src.utils.db import get_db_url
+from src.utils.rate_limit import check_and_increment, get_current_count
+
+
+# ---------------------------------------------------------------------------
+# Styling
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    f"""
+    <style>
+    @import url(
+        'https://fonts.googleapis.com/css2?family=Sora:wght@600;700'
+        '&family=Inter:wght@400;500;600&display=swap'
+    );
+
+    html, body, [class*="css"] {{
+        font-family: 'Inter', sans-serif;
+        color: {COLOR_TEXT};
+    }}
+
+    h1, h2, h3, .kpi-value {{
+        font-family: 'Sora', sans-serif !important;
+        letter-spacing: -0.01em;
+    }}
+
+    [data-testid="stMetricValue"] {{
+        font-family: 'Sora', sans-serif;
+        color: {COLOR_TEXT};
+    }}
+
+    [data-testid="stMetricLabel"] {{
+        color: {COLOR_MUTED};
+    }}
+
+    .block-container {{
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }}
+
+    .stTabs [data-baseweb="tab"] {{
+        font-weight: 500;
+    }}
+
+    .rec-card {{
+        background: {COLOR_SURFACE};
+        border-left: 4px solid var(--rec-color);
+        border-radius: 4px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 0.75rem;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    }}
+
+    .rec-title {{
+        font-family: 'Sora', sans-serif;
+        font-weight: 600;
+        font-size: 1.05rem;
+        margin-bottom: 0.25rem;
+    }}
+
+    .rec-priority {{
+        display: inline-block;
+        font-size: 0.72rem;
+        font-weight: 600;
+        margin-bottom: 0.4rem;
+    }}
+
+    .evidence-item {{
+        color: {COLOR_MUTED};
+        font-size: 0.9rem;
+        margin: 0.15rem 0;
+    }}
+
+    .app-subtitle {{
+        color: {COLOR_MUTED};
+        font-size: 1rem;
+        margin-top: -0.5rem;
+    }}
+
+    #MainMenu {{
+        visibility: hidden;
+    }}
+
+    footer {{
+        visibility: hidden;
+    }}
+
+    [data-testid="stToolbar"] {{
+        visibility: hidden;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Database access
+# ---------------------------------------------------------------------------
+
 
 @st.cache_resource
 def get_engine():
+    """Create and cache the database engine."""
     return create_engine(get_db_url())
 
 
 @st.cache_data(ttl=600)
 def load_kpis() -> dict:
-    with get_engine().connect() as conn:
-        row = conn.execute(text("""
-            SELECT COUNT(*) AS total_orders, COUNT(DISTINCT user_id) AS total_users,
-                   ROUND(AVG(order_value), 2) AS avg_order_value,
-                   ROUND(AVG(CASE WHEN is_repeat_order THEN 1.0 ELSE 0.0 END) * 100, 1) AS repeat_pct
-            FROM orders
-        """)).fetchone()
+    """Load dashboard KPI metrics."""
+    query = text(
+        """
+        SELECT
+            COUNT(*) AS total_orders,
+            COUNT(DISTINCT user_id) AS total_users,
+            ROUND(AVG(order_value), 2) AS avg_order_value,
+            ROUND(
+                AVG(
+                    CASE
+                        WHEN is_repeat_order THEN 1.0
+                        ELSE 0.0
+                    END
+                ) * 100,
+                1
+            ) AS repeat_pct
+        FROM orders
+        """
+    )
+
+    with get_engine().connect() as connection:
+        row = connection.execute(query).fetchone()
+
     return dict(row._mapping)
 
 
 @st.cache_data(ttl=600)
 def load_city_stats() -> pd.DataFrame:
-    with get_engine().connect() as conn:
-        return pd.read_sql(text("""
-            SELECT city, COUNT(*) AS orders, ROUND(AVG(order_value), 2) AS avg_order_value,
-                   ROUND(AVG(CASE WHEN is_repeat_order THEN 1.0 ELSE 0.0 END), 3) AS repeat_rate
-            FROM orders GROUP BY city ORDER BY avg_order_value DESC
-        """), conn)
+    """Load order and repeat-rate statistics by city."""
+    query = text(
+        """
+        SELECT
+            city,
+            COUNT(*) AS orders,
+            ROUND(AVG(order_value), 2) AS avg_order_value,
+            ROUND(
+                AVG(
+                    CASE
+                        WHEN is_repeat_order THEN 1.0
+                        ELSE 0.0
+                    END
+                ),
+                3
+            ) AS repeat_rate
+        FROM orders
+        GROUP BY city
+        ORDER BY avg_order_value DESC
+        """
+    )
+
+    with get_engine().connect() as connection:
+        return pd.read_sql(query, connection)
 
 
 @st.cache_data(ttl=600)
 def load_review_rating_dist() -> pd.DataFrame:
-    with get_engine().connect() as conn:
-        return pd.read_sql(text("""
-            SELECT app, rating, COUNT(*) AS n FROM reviews GROUP BY app, rating ORDER BY app, rating
-        """), conn)
+    """Load review rating distribution by app."""
+    query = text(
+        """
+        SELECT
+            app,
+            rating,
+            COUNT(*) AS n
+        FROM reviews
+        GROUP BY app, rating
+        ORDER BY app, rating
+        """
+    )
+
+    with get_engine().connect() as connection:
+        return pd.read_sql(query, connection)
 
 
 @st.cache_data(ttl=600)
 def load_segments() -> pd.DataFrame:
-    with get_engine().connect() as conn:
-        try:
-            return pd.read_sql(text("""
-                SELECT persona_name, COUNT(*) AS n_users
-                FROM user_segments GROUP BY persona_name ORDER BY n_users DESC
-            """), conn)
-        except Exception:
-            return pd.DataFrame()  # segmentation agent may not have run yet
+    """Load consumer segment counts if segmentation has been run."""
+    query = text(
+        """
+        SELECT
+            persona_name,
+            COUNT(*) AS n_users
+        FROM user_segments
+        GROUP BY persona_name
+        ORDER BY n_users DESC
+        """
+    )
+
+    try:
+        with get_engine().connect() as connection:
+            return pd.read_sql(query, connection)
+    except Exception:
+        return pd.DataFrame()
 
 
-# ---------- LLM-backed calls (cached per question, gated by daily limit) ----------
+# ---------------------------------------------------------------------------
+# LLM-backed analysis
+# ---------------------------------------------------------------------------
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_review_analysis(question: str, app_filter: str):
+def cached_review_analysis(
+    question: str,
+    app_filter: str,
+) -> tuple[dict, int]:
+    """Run and cache review analysis for a question."""
     from src.agents.review_analysis import analyze
-    result, reviews = analyze(question, app_filter=app_filter or None)
+
+    result, reviews = analyze(
+        question,
+        app_filter=app_filter or None,
+    )
+
     return result.model_dump(), len(reviews)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_data_analysis(question: str):
+def cached_data_analysis(
+    question: str,
+) -> tuple[dict, str, list[dict]]:
+    """Run and cache data analysis for a question."""
     from src.agents.data_analyst import analyze
+
     result, df, sql = analyze(question)
+
     return result.model_dump(), sql, df.to_dict("records")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_competitor_research(question: str):
+def cached_competitor_research(question: str) -> dict:
+    """Run and cache competitor research for a question."""
     from src.agents.competitor_research import research
-    result, _raw_search_results = research(question)
+
+    result, _ = research(question)
+
     return result.model_dump()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_strategy(business_question: str, review_q: str, data_q: str, competitor_q: str):
+def cached_strategy(
+    business_question: str,
+    review_question: str,
+    data_question: str,
+    competitor_question: str,
+) -> tuple[dict, object]:
+    """Run and cache the complete strategy analysis."""
     from src.agents.strategy import gather_inputs, synthesize
-    inputs = gather_inputs(review_q, data_q, competitor_q)
+
+    inputs = gather_inputs(
+        review_question,
+        data_question,
+        competitor_question,
+    )
     result = synthesize(business_question, inputs)
+
     return result.model_dump(), inputs
 
 
-def show_friendly_error(exc: Exception):
-    """Public-facing error message. Doesn't leak internal details (DB
-    hosts, SQL, API error bodies) to visitors - just the failure type."""
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+
+def show_friendly_error(exc: Exception) -> None:
+    """Display a safe public-facing error message."""
     st.error(
-        "Something went wrong processing this request. This is usually "
-        "temporary (a busy API or a momentary connection issue). Please "
-        "try again in a moment."
+        "Something went wrong while processing this request. "
+        "Please try again in a moment."
     )
     st.caption(f"Error type: {type(exc).__name__}")
 
 
-def render_recommendation_card(rec: dict):
-    color = PRIORITY_COLORS.get(rec["priority"], COLOR_MUTED)
-    evidence_html = "".join(f'<div class="evidence-item">- {e}</div>' for e in rec["supporting_evidence"])
-    st.markdown(f"""
-    <div class="rec-card" style="--rec-color: {color};">
-        <div class="rec-priority" style="color: {color};">{rec['priority'].upper()} PRIORITY</div>
-        <div class="rec-title">{rec['title']}</div>
-        <div>{rec['rationale']}</div>
-        <div style="margin-top: 0.5rem;">{evidence_html}</div>
-    </div>
-    """, unsafe_allow_html=True)
+def render_recommendation_card(rec: dict) -> None:
+    """Render a strategic recommendation card."""
+    priority = rec["priority"]
+    color = PRIORITY_COLORS.get(priority, COLOR_MUTED)
+
+    evidence_html = "".join(
+        f'<div class="evidence-item">- {evidence}</div>'
+        for evidence in rec["supporting_evidence"]
+    )
+
+    st.markdown(
+        f"""
+        <div class="rec-card" style="--rec-color: {color};">
+            <div class="rec-priority">
+                {priority.upper()} PRIORITY
+            </div>
+            <div class="rec-title">{rec["title"]}</div>
+            <div>{rec["rationale"]}</div>
+            <div style="margin-top: 0.5rem;">
+                {evidence_html}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
-# ---------- Sidebar ----------
+def check_usage_limit(
+    usage_type: str,
+    limit: int,
+) -> bool:
+    """Check whether a request is within its daily usage limit."""
+    allowed, _ = check_and_increment(usage_type, limit)
+
+    if not allowed:
+        st.error(
+            f"Daily {usage_type.replace('_', ' ')} limit reached "
+            f"({limit}/day). Try again tomorrow."
+        )
+
+    return allowed
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
 
 with st.sidebar:
     st.markdown("### Market Intelligence")
     st.caption("Swiggy vs. Zomato/Eternal competitive analysis")
-    st.caption("5 agents: Review Analysis, Data Analyst, Consumer Segmentation, "
-               "Competitor Research, Strategy.")
+    st.caption(
+        "5 agents: Review Analysis, Data Analyst, Consumer "
+        "Segmentation, Competitor Research, Strategy."
+    )
 
-    with st.expander("Usage today", expanded=False):
-        aq = get_current_count("agent_query")
-        sr = get_current_count("strategy_run")
-        st.caption(f"Agent queries: {aq}/{AGENT_QUERY_DAILY_LIMIT}")
-        st.caption(f"Strategy runs: {sr}/{STRATEGY_RUN_DAILY_LIMIT}")
+    with st.expander("Usage today"):
+        agent_queries = get_current_count("agent_query")
+        strategy_runs = get_current_count("strategy_run")
+
+        st.caption(
+            f"Agent queries: {agent_queries}/{AGENT_QUERY_DAILY_LIMIT}"
+        )
+        st.caption(
+            f"Strategy runs: {strategy_runs}/{STRATEGY_RUN_DAILY_LIMIT}"
+        )
 
 
-# ---------- Main ----------
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
 
 st.title("Food Delivery Multi-Agent Insights")
-st.markdown('<p class="app-subtitle">Real reviews, order data, and live market research, synthesized by 5 AI agents</p>',
-            unsafe_allow_html=True)
+st.markdown(
+    '<p class="app-subtitle">'
+    "Real reviews, order data, and live market research, "
+    "synthesized by 5 AI agents"
+    "</p>",
+    unsafe_allow_html=True,
+)
 
 tab_dashboard, tab_agents, tab_strategy, tab_about = st.tabs(
     ["Dashboard", "Ask an Agent", "Full Strategy", "About"]
 )
 
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
+
 with tab_dashboard:
     try:
         kpis = load_kpis()
-    except Exception as e:
-        st.error("Could not load dashboard data right now. Please try again shortly.")
-        st.caption(f"Error type: {type(e).__name__}")
+    except Exception as exc:
+        st.error(
+            "Could not load dashboard data right now. "
+            "Please try again shortly."
+        )
+        st.caption(f"Error type: {type(exc).__name__}")
         st.stop()
 
     k1, k2, k3, k4 = st.columns(4)
+
     k1.metric("Total Orders", f"{kpis['total_orders']:,}")
     k2.metric("Unique Users", f"{kpis['total_users']:,}")
     k3.metric("Avg Order Value", f"₹{kpis['avg_order_value']:,.0f}")
@@ -289,19 +490,40 @@ with tab_dashboard:
 
     st.divider()
     st.subheader("Order data by city")
+
     city_df = load_city_stats()
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = px.bar(city_df, x="city", y="avg_order_value", color_discrete_sequence=[COLOR_ACCENT])
-        fig.update_layout(plot_bgcolor=COLOR_SURFACE, paper_bgcolor=COLOR_SURFACE,
-                           font_color=COLOR_TEXT, title="Average order value by city",
-                           margin=dict(t=40, l=0, r=0, b=0))
+    chart_col1, chart_col2 = st.columns(2)
+
+    with chart_col1:
+        fig = px.bar(
+            city_df,
+            x="city",
+            y="avg_order_value",
+            color_discrete_sequence=[COLOR_ACCENT],
+        )
+        fig.update_layout(
+            plot_bgcolor=COLOR_SURFACE,
+            paper_bgcolor=COLOR_SURFACE,
+            font_color=COLOR_TEXT,
+            title="Average order value by city",
+            margin=dict(t=40, l=0, r=0, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        fig = px.bar(city_df, x="city", y="repeat_rate", color_discrete_sequence=[COLOR_LOW])
-        fig.update_layout(plot_bgcolor=COLOR_SURFACE, paper_bgcolor=COLOR_SURFACE,
-                           font_color=COLOR_TEXT, title="Repeat order rate by city",
-                           margin=dict(t=40, l=0, r=0, b=0))
+
+    with chart_col2:
+        fig = px.bar(
+            city_df,
+            x="city",
+            y="repeat_rate",
+            color_discrete_sequence=[COLOR_LOW],
+        )
+        fig.update_layout(
+            plot_bgcolor=COLOR_SURFACE,
+            paper_bgcolor=COLOR_SURFACE,
+            font_color=COLOR_TEXT,
+            title="Repeat order rate by city",
+            margin=dict(t=40, l=0, r=0, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with st.expander("View raw city data"):
@@ -309,180 +531,287 @@ with tab_dashboard:
 
     st.divider()
     st.subheader("Review rating distribution")
+
     review_df = load_review_rating_dist()
+
     if not review_df.empty:
-        fig = px.bar(review_df, x="rating", y="n", color="app", barmode="group",
-                     color_discrete_sequence=[COLOR_ACCENT, COLOR_LOW])
-        fig.update_layout(plot_bgcolor=COLOR_SURFACE, paper_bgcolor=COLOR_SURFACE,
-                           font_color=COLOR_TEXT, margin=dict(t=20, l=0, r=0, b=0))
+        fig = px.bar(
+            review_df,
+            x="rating",
+            y="n",
+            color="app",
+            barmode="group",
+            color_discrete_sequence=[COLOR_ACCENT, COLOR_LOW],
+        )
+        fig.update_layout(
+            plot_bgcolor=COLOR_SURFACE,
+            paper_bgcolor=COLOR_SURFACE,
+            font_color=COLOR_TEXT,
+            margin=dict(t=20, l=0, r=0, b=0),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     st.subheader("Consumer segments")
-    seg_df = load_segments()
-    if not seg_df.empty:
-        fig = px.bar(seg_df, x="n_users", y="persona_name", orientation="h",
-                     color_discrete_sequence=[COLOR_ACCENT])
-        fig.update_layout(plot_bgcolor=COLOR_SURFACE, paper_bgcolor=COLOR_SURFACE,
-                           font_color=COLOR_TEXT, margin=dict(t=20, l=0, r=0, b=0),
-                           yaxis_title=None, xaxis_title="Users")
+
+    segment_df = load_segments()
+
+    if not segment_df.empty:
+        fig = px.bar(
+            segment_df,
+            x="n_users",
+            y="persona_name",
+            orientation="h",
+            color_discrete_sequence=[COLOR_ACCENT],
+        )
+        fig.update_layout(
+            plot_bgcolor=COLOR_SURFACE,
+            paper_bgcolor=COLOR_SURFACE,
+            font_color=COLOR_TEXT,
+            margin=dict(t=20, l=0, r=0, b=0),
+            yaxis_title=None,
+            xaxis_title="Users",
+        )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Segmentation hasn't been run yet - run `src/agents/segmentation.py` to populate this.")
+        st.info(
+            "Segmentation hasn't been run yet. "
+            "Run `src/agents/segmentation.py` to populate this."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Agent queries
+# ---------------------------------------------------------------------------
 
 with tab_agents:
     st.write(
-        "Ask a specific agent a question. Answers are grounded in real data "
-        "(reviews, orders, or live web search) - agents say so when the data "
-        "doesn't clearly answer your question, rather than guessing."
+        "Ask a specific agent a question. Answers are grounded in real "
+        "data from reviews, orders, or live web search."
     )
 
-    agent_choice = st.selectbox("Agent", ["Review Analysis", "Data Analyst", "Competitor Research"])
+    agent_choice = st.selectbox(
+        "Agent",
+        ["Review Analysis", "Data Analyst", "Competitor Research"],
+    )
 
     if agent_choice == "Review Analysis":
-        question = st.text_input("Your question about app reviews", "What do users complain about most?")
-        app_filter = st.selectbox("App", ["", "swiggy", "zomato"], format_func=lambda x: x or "Both apps")
-        asked = st.button("Ask Review Analysis Agent", type="primary")
+        question = st.text_input(
+            "Your question about app reviews",
+            "What do users complain about most?",
+        )
+        app_filter = st.selectbox(
+            "App",
+            ["", "swiggy", "zomato"],
+            format_func=lambda value: value or "Both apps",
+        )
+        asked = st.button(
+            "Ask Review Analysis Agent",
+            type="primary",
+        )
+
         if not asked:
-            st.caption("Try: \"What do people say about delivery speed?\" or \"Are customers happy with order accuracy?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
-            else:
-                try:
-                    with st.spinner("Retrieving reviews and analyzing..."):
-                        result, n_reviews = cached_review_analysis(question, app_filter)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.caption(f"Based on {n_reviews} retrieved reviews")
-                    st.write(result["summary"])
-                    st.markdown("**Top complaints:**")
-                    for c in result["top_complaints"]:
-                        st.write(f"- {c}")
-                    if result.get("confidence_note"):
-                        st.warning(result["confidence_note"])
+            st.caption(
+                'Try: "What do people say about delivery speed?" '
+                'or "Are customers happy with order accuracy?"'
+            )
+
+        if asked and check_usage_limit(
+            "agent_query",
+            AGENT_QUERY_DAILY_LIMIT,
+        ):
+            try:
+                with st.spinner("Retrieving reviews and analyzing..."):
+                    result, review_count = cached_review_analysis(
+                        question,
+                        app_filter,
+                    )
+            except Exception as exc:
+                show_friendly_error(exc)
+                st.stop()
+
+            with st.chat_message("assistant"):
+                st.caption(
+                    f"Based on {review_count} retrieved reviews"
+                )
+                st.write(result["summary"])
+
+                st.markdown("**Top complaints:**")
+                for complaint in result["top_complaints"]:
+                    st.write(f"- {complaint}")
+
+                if result.get("confidence_note"):
+                    st.warning(result["confidence_note"])
 
     elif agent_choice == "Data Analyst":
-        question = st.text_input("Your question about order data", "Which cities have the highest order values?")
-        asked = st.button("Ask Data Analyst Agent", type="primary")
-        if not asked:
-            st.caption("Try: \"What's the average spend per city?\" or \"How does repeat rate vary by age group?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
-            else:
-                try:
-                    with st.spinner("Generating SQL and analyzing..."):
-                        result, sql, rows = cached_data_analysis(question)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.code(sql, language="sql")
-                    st.write(result["summary"])
-                    for f in result["key_findings"]:
-                        st.write(f"- {f}")
-                    if result.get("caveats"):
-                        st.warning(result["caveats"])
+        question = st.text_input(
+            "Your question about order data",
+            "Which cities have the highest order values?",
+        )
+        asked = st.button(
+            "Ask Data Analyst Agent",
+            type="primary",
+        )
 
-    else:  # Competitor Research
+        if not asked:
+            st.caption(
+                'Try: "What\'s the average spend per city?" '
+                'or "How does repeat rate vary by age group?"'
+            )
+
+        if asked and check_usage_limit(
+            "agent_query",
+            AGENT_QUERY_DAILY_LIMIT,
+        ):
+            try:
+                with st.spinner("Generating SQL and analyzing..."):
+                    result, sql, _ = cached_data_analysis(question)
+            except Exception as exc:
+                show_friendly_error(exc)
+                st.stop()
+
+            with st.chat_message("assistant"):
+                st.code(sql, language="sql")
+                st.write(result["summary"])
+
+                for finding in result["key_findings"]:
+                    st.write(f"- {finding}")
+
+                if result.get("caveats"):
+                    st.warning(result["caveats"])
+
+    else:
         question = st.text_input(
             "Your question about the market",
-            "What recent moves have Swiggy and Zomato made in quick commerce?",
+            "What recent moves have Swiggy and Zomato made "
+            "in quick commerce?",
         )
-        asked = st.button("Ask Competitor Research Agent", type="primary")
+        asked = st.button(
+            "Ask Competitor Research Agent",
+            type="primary",
+        )
+
         if not asked:
-            st.caption("Try: \"How is Blinkit performing against Instamart?\" or \"What's the latest on Eternal's profitability?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
-            else:
-                try:
-                    with st.spinner("Searching the web and analyzing..."):
-                        result = cached_competitor_research(question)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.write(result["summary"])
-                    for f in result["key_findings"]:
-                        st.write(f"- {f}")
-                    if result["sources"]:
-                        st.markdown("**Sources:**")
-                        for s in result["sources"]:
-                            st.write(f"- {s}")
+            st.caption(
+                'Try: "How is Blinkit performing against Instamart?" '
+                'or "What\'s the latest on Eternal\'s profitability?"'
+            )
+
+        if asked and check_usage_limit(
+            "agent_query",
+            AGENT_QUERY_DAILY_LIMIT,
+        ):
+            try:
+                with st.spinner("Searching the web and analyzing..."):
+                    result = cached_competitor_research(question)
+            except Exception as exc:
+                show_friendly_error(exc)
+                st.stop()
+
+            with st.chat_message("assistant"):
+                st.write(result["summary"])
+
+                for finding in result["key_findings"]:
+                    st.write(f"- {finding}")
+
+                if result["sources"]:
+                    st.markdown("**Sources:**")
+                    for source in result["sources"]:
+                        st.write(f"- {source}")
+
+
+# ---------------------------------------------------------------------------
+# Full strategy
+# ---------------------------------------------------------------------------
 
 with tab_strategy:
     st.write(
-        "Runs all 5 agents and synthesizes a full strategic recommendation. "
-        "This is the most expensive operation (~8-9 AI calls), so it's capped "
-        "more tightly than individual agent questions."
+        "Run all 5 agents and synthesize a full strategic recommendation. "
+        "This is the most expensive operation and has a lower daily limit."
     )
 
-    business_q = st.text_area(
+    business_question = st.text_area(
         "Business question",
-        "What should Swiggy prioritize over the next 1-2 quarters to improve "
-        "customer retention and competitive position against Zomato/Eternal?",
+        "What should Swiggy prioritize over the next 1-2 quarters "
+        "to improve customer retention and competitive position "
+        "against Zomato/Eternal?",
     )
 
-    run_clicked = st.button("Run Full Strategy Analysis", type="primary")
+    run_clicked = st.button(
+        "Run Full Strategy Analysis",
+        type="primary",
+    )
 
     if not run_clicked:
         st.caption(
-            "Runs Review Analysis, Data Analyst, Consumer Segmentation, and "
-            "Competitor Research in parallel, then synthesizes prioritized, "
-            "evidence-cited recommendations. Takes about a minute."
+            "Runs Review Analysis, Data Analyst, Consumer Segmentation, "
+            "and Competitor Research in parallel, then synthesizes "
+            "prioritized, evidence-cited recommendations."
         )
 
-    if run_clicked:
-        allowed, count = check_and_increment("strategy_run", STRATEGY_RUN_DAILY_LIMIT)
-        if not allowed:
-            st.error(f"Daily strategy-run limit reached ({STRATEGY_RUN_DAILY_LIMIT}/day). Try again tomorrow.")
-        else:
-            try:
-                with st.spinner("Running all 5 agents, this takes a minute..."):
-                    result, inputs = cached_strategy(
-                        business_q,
-                        review_q="What are the most common complaints about delivery time and order accuracy?",
-                        data_q="Which cities have the highest average order value, and how does repeat order rate vary by city?",
-                        competitor_q="What recent strategic moves have Swiggy and Zomato/Eternal made in the Indian quick-commerce or food delivery space?",
-                    )
-            except Exception as e:
-                show_friendly_error(e)
-                st.stop()
+    if run_clicked and check_usage_limit(
+        "strategy_run",
+        STRATEGY_RUN_DAILY_LIMIT,
+    ):
+        try:
+            with st.spinner("Running all 5 agents, this takes a minute..."):
+                result, _ = cached_strategy(
+                    business_question,
+                    review_question=(
+                        "What are the most common complaints about "
+                        "delivery time and order accuracy?"
+                    ),
+                    data_question=(
+                        "Which cities have the highest average order value, "
+                        "and how does repeat order rate vary by city?"
+                    ),
+                    competitor_question=(
+                        "What recent strategic moves have Swiggy and "
+                        "Zomato/Eternal made in the Indian quick-commerce "
+                        "or food delivery space?"
+                    ),
+                )
+        except Exception as exc:
+            show_friendly_error(exc)
+            st.stop()
 
-            st.subheader("Executive Summary")
-            st.write(result["executive_summary"])
+        st.subheader("Executive Summary")
+        st.write(result["executive_summary"])
 
-            st.subheader("Recommendations")
-            for rec in result["recommendations"]:
-                render_recommendation_card(rec)
+        st.subheader("Recommendations")
+        for recommendation in result["recommendations"]:
+            render_recommendation_card(recommendation)
 
-            st.subheader("Data Quality Caveats")
-            for c in result["data_quality_caveats"]:
-                st.warning(c)
+        st.subheader("Data Quality Caveats")
+        for caveat in result["data_quality_caveats"]:
+            st.warning(caveat)
 
-            if result.get("confidence_note"):
-                st.info(result["confidence_note"])
+        if result.get("confidence_note"):
+            st.info(result["confidence_note"])
+
+
+# ---------------------------------------------------------------------------
+# About
+# ---------------------------------------------------------------------------
 
 with tab_about:
-    a1, a2 = st.columns([2, 1])
-    with a1:
-        st.markdown("""
-This project analyzes Swiggy and Zomato/Eternal's position in the Indian food
-delivery and quick commerce market using 5 specialized AI agents:
+    about_col, metrics_col = st.columns([2, 1])
 
-- **Review Analysis**: RAG over real Play Store reviews
-- **Data Analyst**: text-to-SQL over order data, with read-only guardrails
-- **Consumer Segmentation**: KMeans clustering with LLM-generated personas
-- **Competitor Research**: live web search via Tavily
-- **Strategy**: synthesizes the other four, weighting real data above synthetic data
-        """)
-    with a2:
+    with about_col:
+        st.markdown(
+            """
+            This project analyzes Swiggy and Zomato/Eternal's position in
+            the Indian food delivery and quick commerce market using
+            five specialized AI agents:
+
+            - **Review Analysis:** RAG over real Play Store reviews
+            - **Data Analyst:** Text-to-SQL over order data with read-only guardrails
+            - **Consumer Segmentation:** KMeans clustering with LLM-generated personas
+            - **Competitor Research:** Live web search via Tavily
+            - **Strategy:** Synthesizes the other four agents
+            """
+        )
+
+    with metrics_col:
         st.metric("Agents", "5")
         st.metric("Data sources", "4")
