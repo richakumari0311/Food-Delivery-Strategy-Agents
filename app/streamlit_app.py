@@ -209,6 +209,83 @@ def cached_data_analysis(question: str):
     return result.model_dump(), sql, df.to_dict("records")
 
 
+def condense_question(history: list, new_question: str) -> str:
+    """Rewrite a follow-up question into a standalone one using prior
+    conversation turns, so the underlying agent (which has no memory of
+    its own) still gets something searchable/queryable on its own.
+    Skipped entirely if there's no history yet - first question in a
+    session is always already standalone. NOT cached (unlike the agent
+    calls below) - history is unique per session and not worth caching."""
+    if not history:
+        return new_question
+
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    history_block = "\n".join(
+        f"Q: {turn['question']}\nA: {turn['answer_summary']}" for turn in history[-3:]  # last 3 turns is enough context
+    )
+    prompt = (
+        "Given this conversation history and a new follow-up question, rewrite "
+        "the follow-up into a standalone question that includes all context "
+        "needed to understand it without the history. If it's already "
+        "standalone, return it completely unchanged. Return ONLY the question, "
+        "nothing else.\n\n"
+        f"CONVERSATION SO FAR:\n{history_block}\n\n"
+        f"FOLLOW-UP: {new_question}"
+    )
+    llm = ChatGoogleGenerativeAI(model=os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+                                  temperature=0, timeout=30, google_api_key=os.getenv("GEMINI_API_KEY"))
+    try:
+        return llm.invoke(prompt).content.strip()
+    except Exception:
+        return new_question  # if condensing fails, fall back to the raw question rather than blocking
+
+
+def render_agent_response(agent_choice: str, result: dict, sql: str = None, n_reviews: int = None):
+    """Renders one assistant response with consistent formatting. Used for
+    BOTH the fresh response right after asking AND when redrawing history -
+    previously these used different code paths and looked inconsistent
+    (history flattened to plain text, live response nicely formatted).
+    Single source of truth now."""
+    if agent_choice == "Review Analysis" and n_reviews is not None:
+        st.caption(f"Based on {n_reviews} retrieved reviews")
+    if agent_choice == "Data Analyst" and sql:
+        st.code(sql, language="sql")
+
+    st.write(result["summary"])
+
+    key_list = result.get("top_complaints") or result.get("key_findings") or []
+    label = "Top complaints:" if agent_choice == "Review Analysis" else "Key findings:"
+    if key_list:
+        st.markdown(f"**{label}**")
+        for item in key_list:
+            st.write(f"- {item}")
+
+    note = result.get("confidence_note") or result.get("caveats")
+    if note:
+        st.warning(note)
+
+    if agent_choice == "Competitor Research" and result.get("sources"):
+        st.markdown("**Sources:**")
+        for s in result["sources"]:
+            st.write(f"- {s}")
+
+
+def render_agent_chat_history(agent_key: str):
+    """Render all prior turns for this agent as a chat thread, using the
+    same render_agent_response function as live answers - so history looks
+    identical to how it looked when it was first shown."""
+    history = st.session_state.chat_history.get(agent_key, [])
+    for turn in history:
+        with st.chat_message("user"):
+            st.write(turn["question"])
+        with st.chat_message("assistant"):
+            render_agent_response(
+                turn["agent_choice"], turn["result"],
+                sql=turn.get("sql"), n_reviews=turn.get("n_reviews"),
+            )
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_competitor_research(question: str):
     from src.agents.competitor_research import research
@@ -249,6 +326,9 @@ def render_recommendation_card(rec: dict):
 
 
 # ---------- Sidebar ----------
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = {"review": [], "data": [], "competitor": []}
 
 with st.sidebar:
     st.markdown("### Market Intelligence")
@@ -330,98 +410,102 @@ with tab_dashboard:
     else:
         st.info("Segmentation hasn't been run yet - run `src/agents/segmentation.py` to populate this.")
 
-with tab_agents:
-    st.write(
-        "Ask a specific agent a question. Answers are grounded in real data "
-        "(reviews, orders, or live web search) - agents say so when the data "
-        "doesn't clearly answer your question, rather than guessing."
-    )
+@st.fragment
+def render_ask_agent_tab():
+    """Wrapped in st.fragment so asking a question only reruns THIS part of
+    the page, not the whole app - meaningfully faster than a full rerun.
+    NOTE: st.bottom cannot be used inside a fragment (Streamlit raises
+    StreamlitFragmentWidgetsNotAllowedOutsideError - a fragment can't write
+    widgets to the app's root-level bottom container, which is "outside"
+    the fragment's own boundary). So chat_input renders inline here rather
+    than pinned to the viewport edge; the bordered panel below keeps
+    history and input visually together as one unit instead."""
+    st.write("Pick an agent below and ask about customer reviews, order trends, "
+              "or what competitors are doing. Feel free to ask follow-up questions.")
 
     agent_choice = st.selectbox("Agent", ["Review Analysis", "Data Analyst", "Competitor Research"])
+    agent_key = {"Review Analysis": "review", "Data Analyst": "data", "Competitor Research": "competitor"}[agent_choice]
 
     if agent_choice == "Review Analysis":
-        question = st.text_input("Your question about app reviews", "What do users complain about most?")
-        app_filter = st.selectbox("App", ["", "swiggy", "zomato"], format_func=lambda x: x or "Both apps")
-        asked = st.button("Ask Review Analysis Agent", type="primary")
-        if not asked:
-            st.caption("Try: \"What do people say about delivery speed?\" or \"Are customers happy with order accuracy?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
-            else:
-                try:
-                    with st.spinner("Retrieving reviews and analyzing..."):
-                        result, n_reviews = cached_review_analysis(question, app_filter)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.caption(f"Based on {n_reviews} retrieved reviews")
-                    st.write(result["summary"])
-                    st.markdown("**Top complaints:**")
-                    for c in result["top_complaints"]:
-                        st.write(f"- {c}")
-                    if result.get("confidence_note"):
-                        st.warning(result["confidence_note"])
+        app_filter = st.selectbox("App", ["", "swiggy", "zomato"], format_func=lambda x: x or "Both apps",
+                                   key="app_filter_review")
 
-    elif agent_choice == "Data Analyst":
-        question = st.text_input("Your question about order data", "Which cities have the highest order values?")
-        asked = st.button("Ask Data Analyst Agent", type="primary")
-        if not asked:
-            st.caption("Try: \"What's the average spend per city?\" or \"How does repeat rate vary by age group?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
-            else:
-                try:
-                    with st.spinner("Generating SQL and analyzing..."):
-                        result, sql, rows = cached_data_analysis(question)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.code(sql, language="sql")
-                    st.write(result["summary"])
-                    for f in result["key_findings"]:
-                        st.write(f"- {f}")
-                    if result.get("caveats"):
-                        st.warning(result["caveats"])
+    history = st.session_state.chat_history[agent_key]
 
-    else:  # Competitor Research
-        question = st.text_input(
-            "Your question about the market",
-            "What recent moves have Swiggy and Zomato made in quick commerce?",
-        )
-        asked = st.button("Ask Competitor Research Agent", type="primary")
-        if not asked:
-            st.caption("Try: \"How is Blinkit performing against Instamart?\" or \"What's the latest on Eternal's profitability?\"")
-        if asked:
-            allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
-            if not allowed:
-                st.error(f"Daily query limit reached ({AGENT_QUERY_DAILY_LIMIT}/day). Try again tomorrow.")
+    # Single bordered panel holding history + input together, so they read
+    # as one connected chat unit even though chat_input can't be pinned to
+    # the viewport bottom inside a fragment (see note above).
+    with st.container(border=True):
+        chat_box = st.container(height=380)
+        with chat_box:
+            if not history:
+                example = {
+                    "Review Analysis": "What do people say about delivery speed?",
+                    "Data Analyst": "What's the average spend per city?",
+                    "Competitor Research": "How is Blinkit performing against Instamart?",
+                }[agent_choice]
+                st.caption(f'No messages yet. Try: "{example}"')
             else:
-                try:
-                    with st.spinner("Searching the web and analyzing..."):
-                        result = cached_competitor_research(question)
-                except Exception as e:
-                    show_friendly_error(e)
-                    st.stop()
-                with st.chat_message("assistant"):
-                    st.write(result["summary"])
-                    for f in result["key_findings"]:
-                        st.write(f"- {f}")
-                    if result["sources"]:
-                        st.markdown("**Sources:**")
-                        for s in result["sources"]:
-                            st.write(f"- {s}")
+                render_agent_chat_history(agent_key)
+
+        question = st.chat_input(f"Ask the {agent_choice} agent...", key=f"chat_input_{agent_key}")
+
+    if st.button("Clear conversation", key=f"clear_{agent_key}"):
+        st.session_state.chat_history[agent_key] = []
+        st.rerun(scope="fragment")
+
+    if question:
+        allowed, count = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
+        if not allowed:
+            st.error("You've reached today's question limit for this app. Please try again tomorrow.")
+            st.stop()
+
+        # A follow-up (when there's prior history) costs a second call
+        # against the same daily limit - one to understand context from
+        # the conversation, one to actually answer. Not shown to the user;
+        # this is an internal accounting detail, not something they need
+        # to reason about while using the app.
+        standalone_question = question
+        if history:
+            condense_allowed, _ = check_and_increment("agent_query", AGENT_QUERY_DAILY_LIMIT)
+            if condense_allowed:
+                standalone_question = condense_question(history, question)
+
+        sql, n_reviews = None, None
+        try:
+            if agent_choice == "Review Analysis":
+                with st.spinner("Retrieving reviews and analyzing..."):
+                    result, n_reviews = cached_review_analysis(standalone_question, app_filter)
+            elif agent_choice == "Data Analyst":
+                with st.spinner("Generating SQL and analyzing..."):
+                    result, sql, rows = cached_data_analysis(standalone_question)
+            else:
+                with st.spinner("Searching the web and analyzing..."):
+                    result = cached_competitor_research(standalone_question)
+        except Exception as e:
+            show_friendly_error(e)
+            st.stop()
+
+        st.session_state.chat_history[agent_key].append({
+            "question": question,
+            "standalone_question": standalone_question,
+            "answer_summary": result["summary"],
+            "agent_choice": agent_choice,
+            "result": result,
+            "sql": sql,
+            "n_reviews": n_reviews,
+        })
+        st.rerun(scope="fragment")
+
+
+with tab_agents:
+    render_ask_agent_tab()
 
 with tab_strategy:
     st.write(
-        "Runs all 5 agents and synthesizes a full strategic recommendation. "
-        "This is the most expensive operation (~8-9 AI calls), so it's capped "
-        "more tightly than individual agent questions."
+        "Get a complete strategic recommendation, combining review sentiment, "
+        "order data, customer segments, and live market research into one "
+        "prioritized analysis. Takes about a minute to run."
     )
 
     business_q = st.text_area(
@@ -432,20 +516,13 @@ with tab_strategy:
 
     run_clicked = st.button("Run Full Strategy Analysis", type="primary")
 
-    if not run_clicked:
-        st.caption(
-            "Runs Review Analysis, Data Analyst, Consumer Segmentation, and "
-            "Competitor Research in parallel, then synthesizes prioritized, "
-            "evidence-cited recommendations. Takes about a minute."
-        )
-
     if run_clicked:
         allowed, count = check_and_increment("strategy_run", STRATEGY_RUN_DAILY_LIMIT)
         if not allowed:
             st.error(f"Daily strategy-run limit reached ({STRATEGY_RUN_DAILY_LIMIT}/day). Try again tomorrow.")
         else:
             try:
-                with st.spinner("Running all 5 agents, this takes a minute..."):
+                with st.spinner("Analyzing reviews, orders, customer segments, and the market..."):
                     result, inputs = cached_strategy(
                         business_q,
                         review_q="What are the most common complaints about delivery time and order accuracy?",

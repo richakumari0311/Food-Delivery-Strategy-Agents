@@ -1,42 +1,23 @@
-"""
-Data Analyst Agent (standalone, pre-LangGraph).
-
-Given a question about order/user behavior, this:
-  1. Asks Gemini to write a SQL query against the orders/user_features schema
-     (structured output - not free text - so we get a clean query string)
-  2. Validates the query is read-only and safe before running it
-  3. Executes it and gets real rows back
-  4. Asks Gemini again to turn those actual rows into a structured
-     narrative finding - grounded in the real numbers, not guessed
-
-SETUP:
-   pip install langchain-google-genai pydantic psycopg2-binary python-dotenv pandas
-
-RUN:
-   python agents/data_analyst_agent.py
-"""
+"""Data analysis agent using Gemini and PostgreSQL."""
 
 import os
 import re
-from typing import Optional
+from typing import Any, Optional
 
-from dotenv import load_dotenv
 import pandas as pd
 import psycopg2
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
 
-from src.utils.retry import with_llm_retry, with_db_retry
 from src.utils.db import get_db_config
+from src.utils.retry import with_db_retry, with_llm_retry
+
 
 load_dotenv()
 
-# Override in .env, e.g. GEMINI_MODEL=gemini-3.5-flash-lite for a much higher
-# free-tier daily quota (~500/day vs ~20/day) while iterating.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-
 DB_CONFIG = get_db_config()
-
 MAX_ROWS = 200
 
 SCHEMA_DESCRIPTION = """
@@ -62,11 +43,10 @@ CRITICAL: if a question asks about real business/financial metrics (revenue, pro
 quarterly earnings, actual company performance), you MUST explicitly state in your
 summary and caveats that any number computed from this table (e.g. SUM(order_value))
 is a sum over synthetic pipeline-test data, NOT the company's actual real-world
-revenue or financial performance. Never present such a number as if it answers a
-real business question about the company's true finances.
+revenue or financial performance. Never present such a number as if it answers a real
+business question about the company's true finances.
 """
 
-# Guardrails: block anything that isn't a single read-only SELECT
 FORBIDDEN_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|CREATE|COPY)\b",
     re.IGNORECASE,
@@ -74,126 +54,241 @@ FORBIDDEN_PATTERN = re.compile(
 
 
 class SQLGeneration(BaseModel):
-    sql_query: str = Field(description="A single read-only PostgreSQL SELECT query answering the question")
-    explanation: str = Field(description="One sentence on what the query computes")
+    """Structured output generated from the SQL generation step."""
+
+    sql_query: str = Field(
+        description="A single read-only PostgreSQL SELECT query."
+    )
+    explanation: str = Field(
+        description="One sentence explaining what the query computes."
+    )
 
 
 class DataAnalysisResult(BaseModel):
-    summary: str = Field(description="2-3 sentence answer to the question, grounded in the actual query results")
-    key_findings: list[str] = Field(description="3-5 specific numeric findings from the data")
-    caveats: Optional[str] = Field(default=None, description="Any data quality caveats relevant to this answer")
+    """Structured output generated from query results."""
+
+    summary: str = Field(
+        description=(
+            "A 2-3 sentence answer to the question, "
+            "grounded in the actual query results."
+        )
+    )
+    key_findings: list[str] = Field(
+        description="3-5 specific numeric findings from the data."
+    )
+    caveats: Optional[str] = Field(
+        default=None,
+        description="Relevant data quality or interpretation caveats.",
+    )
 
 
 def validate_sql(sql: str) -> str:
+    """Validate a SQL query and enforce a maximum result size."""
+
     sql = sql.strip().rstrip(";")
+
     if not sql.upper().startswith("SELECT"):
         raise ValueError(f"Rejected non-SELECT query: {sql[:80]}")
+
     if ";" in sql:
         raise ValueError("Rejected multi-statement query")
+
     if FORBIDDEN_PATTERN.search(sql):
-        raise ValueError(f"Rejected query containing forbidden keyword: {sql[:80]}")
+        raise ValueError(
+            f"Rejected query containing forbidden keyword: {sql[:80]}"
+        )
+
     if "LIMIT" not in sql.upper():
         sql = f"{sql} LIMIT {MAX_ROWS}"
+
     return sql
 
 
 @with_db_retry()
 def run_query(sql: str) -> pd.DataFrame:
+    """Execute a read-only SQL query and return the results as a DataFrame."""
+
     conn = psycopg2.connect(**DB_CONFIG)
+
     try:
-        with conn.cursor() as cur:
-            cur.execute("SET TRANSACTION READ ONLY")  # defense in depth beyond the regex check
-            cur.execute(sql)
-            cols = [desc[0] for desc in cur.description]
-            rows = cur.fetchall()
-        return pd.DataFrame(rows, columns=cols)
+        with conn.cursor() as cursor:
+            cursor.execute("SET TRANSACTION READ ONLY")
+            cursor.execute(sql)
+
+            columns = [description[0] for description in cursor.description]
+            rows = cursor.fetchall()
+
+        return pd.DataFrame(rows, columns=columns)
     finally:
         conn.close()
 
 
 @with_llm_retry()
-def _generate_sql(llm, prompt: str) -> SQLGeneration:
+def _generate_sql(
+    llm: ChatGoogleGenerativeAI,
+    prompt: str,
+) -> SQLGeneration:
+    """Generate a structured SQL query using Gemini."""
+
     return llm.with_structured_output(SQLGeneration).invoke(prompt)
 
 
 @with_llm_retry()
-def _generate_analysis(llm, prompt: str) -> DataAnalysisResult:
+def _generate_analysis(
+    llm: ChatGoogleGenerativeAI,
+    prompt: str,
+) -> DataAnalysisResult:
+    """Generate a structured analysis from query results."""
+
     return llm.with_structured_output(DataAnalysisResult).invoke(prompt)
 
 
-def analyze(question: str, max_sql_attempts: int = 2):
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=60, google_api_key=os.getenv("GEMINI_API_KEY"))
+def _create_llm() -> ChatGoogleGenerativeAI:
+    """Create the configured Gemini client."""
 
-    sql_prompt = (
+    return ChatGoogleGenerativeAI(
+        model=GEMINI_MODEL,
+        temperature=0,
+        timeout=60,
+        google_api_key=os.getenv("GEMINI_API_KEY"),
+    )
+
+
+def _build_sql_prompt(question: str) -> str:
+    """Build the initial SQL generation prompt."""
+
+    return (
         "You write PostgreSQL SELECT queries against this schema:\n"
         f"{SCHEMA_DESCRIPTION}\n\n"
         f"QUESTION: {question}\n\n"
-        "Write ONE read-only SELECT query that answers it. Prefer aggregates "
-        "(GROUP BY, AVG, COUNT) over raw row dumps."
+        "Write ONE read-only SELECT query that answers the question. "
+        "Prefer aggregates such as GROUP BY, AVG, and COUNT over raw "
+        "row dumps."
     )
 
-    df = None
-    safe_sql = None
-    last_db_error = None
+
+def _build_retry_prompt(
+    question: str,
+    sql: str,
+    db_error: str,
+) -> str:
+    """Build a SQL correction prompt using the database error."""
+
+    return (
+        "You write PostgreSQL SELECT queries against this schema:\n"
+        f"{SCHEMA_DESCRIPTION}\n\n"
+        f"QUESTION: {question}\n\n"
+        f"PREVIOUS QUERY:\n{sql}\n\n"
+        f"DATABASE ERROR:\n{db_error}\n\n"
+        "Write a corrected read-only SELECT query. Pay attention to the "
+        "actual column types described in the schema. For example, "
+        "order_time is a text daypart bucket such as 'Morning' or "
+        "'Evening', not a timestamp."
+    )
+
+
+def _build_analysis_prompt(
+    question: str,
+    sql: str,
+    df: pd.DataFrame,
+) -> str:
+    """Build the prompt used to interpret query results."""
+
+    results_block = df.head(50).to_string(index=False)
+
+    return (
+        f"QUESTION: {question}\n\n"
+        f"SQL USED: {sql}\n\n"
+        f"QUERY RESULTS ({len(df)} rows, showing up to 50):\n"
+        f"{results_block}\n\n"
+        f"{SCHEMA_DESCRIPTION}\n"
+        "Answer the question using ONLY these results. "
+        "Cite actual numbers and do not infer unsupported conclusions."
+    )
+
+
+def analyze(
+    question: str,
+    max_sql_attempts: int = 2,
+) -> tuple[DataAnalysisResult, pd.DataFrame, Optional[str]]:
+    """Generate, validate, execute, and analyze a SQL query."""
+
+    llm = _create_llm()
+    sql_prompt = _build_sql_prompt(question)
+
+    df: Optional[pd.DataFrame] = None
+    safe_sql: Optional[str] = None
+    last_db_error: Optional[str] = None
 
     for attempt in range(1, max_sql_attempts + 1):
-        sql_gen = _generate_sql(llm, sql_prompt)
-        safe_sql = validate_sql(sql_gen.sql_query)
+        sql_generation = _generate_sql(llm, sql_prompt)
+        safe_sql = validate_sql(sql_generation.sql_query)
+
         print(f"Generated SQL (attempt {attempt}):\n  {safe_sql}\n")
 
         try:
             df = run_query(safe_sql)
             print(f"Returned {len(df)} rows\n")
-            break  # success
-        except psycopg2.Error as e:
-            last_db_error = str(e).strip()
-            print(f"  SQL execution failed: {last_db_error[:200]}")
-            if attempt == max_sql_attempts:
-                break
-            # Feed the actual DB error back and ask for a corrected query -
-            # same self-correction loop pattern as a human debugging SQL.
-            sql_prompt = (
-                "You write PostgreSQL SELECT queries against this schema:\n"
-                f"{SCHEMA_DESCRIPTION}\n\n"
-                f"QUESTION: {question}\n\n"
-                f"Your previous query failed:\n{safe_sql}\n\n"
-                f"DATABASE ERROR:\n{last_db_error}\n\n"
-                "Write a corrected read-only SELECT query. Pay attention to actual "
-                "column types described in the schema (e.g. order_time is a text "
-                "daypart bucket like 'Morning'/'Evening', NOT a timestamp - it "
-                "cannot be used with DATE_TRUNC or similar date functions)."
-            )
+            break
+        except psycopg2.Error as error:
+            last_db_error = str(error).strip()
+            print(f"SQL execution failed: {last_db_error[:200]}")
+
+            if attempt < max_sql_attempts:
+                sql_prompt = _build_retry_prompt(
+                    question=question,
+                    sql=safe_sql,
+                    db_error=last_db_error,
+                )
 
     if df is None:
-        # Every attempt failed - fail gracefully instead of crashing the caller
-        return DataAnalysisResult(
-            summary="Could not answer this question - the generated SQL query failed to execute.",
-            key_findings=[],
-            caveats=f"Database error after {max_sql_attempts} attempt(s): {last_db_error}",
-        ), pd.DataFrame(), safe_sql
+        return (
+            DataAnalysisResult(
+                summary=(
+                    "Could not answer this question because the "
+                    "generated SQL query failed to execute."
+                ),
+                key_findings=[],
+                caveats=(
+                    f"Database error after {max_sql_attempts} attempt(s): "
+                    f"{last_db_error}"
+                ),
+            ),
+            pd.DataFrame(),
+            safe_sql,
+        )
 
     if df.empty:
-        return DataAnalysisResult(
-            summary="The query returned no rows.",
-            key_findings=[],
-            caveats="Query may be too restrictive, or no matching data exists.",
-        ), df, safe_sql
+        return (
+            DataAnalysisResult(
+                summary="The query returned no rows.",
+                key_findings=[],
+                caveats=(
+                    "The query may be too restrictive, or no matching "
+                    "data exists."
+                ),
+            ),
+            df,
+            safe_sql,
+        )
 
-    results_block = df.head(50).to_string(index=False)
-    analysis_prompt = (
-        f"QUESTION: {question}\n\n"
-        f"SQL USED: {safe_sql}\n\n"
-        f"QUERY RESULTS ({len(df)} rows, showing up to 50):\n{results_block}\n\n"
-        f"{SCHEMA_DESCRIPTION}\n"
-        "Answer the question using ONLY these results. Cite actual numbers."
+    analysis_prompt = _build_analysis_prompt(
+        question=question,
+        sql=safe_sql,
+        df=df,
     )
+
     result = _generate_analysis(llm, analysis_prompt)
 
     return result, df, safe_sql
 
 
 if __name__ == "__main__":
-    question = "Which cities have the highest average order value, and how does repeat order rate vary by city?"
+    question = (
+        "Which cities have the highest average order value, and how does "
+        "repeat order rate vary by city?"
+    )
+
     print(f"Question: {question}\n")
 
     result, df, sql = analyze(question)
