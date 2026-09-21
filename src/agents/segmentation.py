@@ -107,7 +107,7 @@ def build_cluster_profiles(df: pd.DataFrame) -> pd.DataFrame:
 
 @with_llm_retry()
 def generate_personas(profile: pd.DataFrame) -> PersonaSet:
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.3, timeout=60)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.3, timeout=60, google_api_key=os.getenv("GEMINI_API_KEY"))
     prompt = (
         "Here are statistical profiles of customer segments from KMeans clustering "
         "on a food delivery app's user base. For EACH cluster_id, give it a short "

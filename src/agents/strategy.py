@@ -94,7 +94,7 @@ def gather_inputs(review_question: str, data_question: str, competitor_question:
 
 
 def synthesize(business_question: str, inputs: dict) -> StrategyResult:
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.2, timeout=60)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0.2, timeout=60, google_api_key=os.getenv("GEMINI_API_KEY"))
 
     prompt = f"""You are a strategy analyst synthesizing findings from four specialist agents
 to answer a business question. You must weigh the inputs according to their

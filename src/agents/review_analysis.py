@@ -124,7 +124,7 @@ def analyze(question: str, app_filter: Optional[str] = None) -> ReviewAnalysis:
         f"[{r['app']} | {r['rating']}★] {r['text']}" for r in reviews
     )
 
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=60)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=60, google_api_key=os.getenv("GEMINI_API_KEY"))
     structured_llm = llm.with_structured_output(ReviewAnalysis)
 
     prompt = (

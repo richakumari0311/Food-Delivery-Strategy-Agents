@@ -92,7 +92,7 @@ def research(question: str) -> tuple[CompetitorResearchResult, list[dict]]:
         "than filling gaps."
     )
 
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=60)
+    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, timeout=60, google_api_key=os.getenv("GEMINI_API_KEY"))
     result = _synthesize(llm, prompt)
 
     if not result.sources:
