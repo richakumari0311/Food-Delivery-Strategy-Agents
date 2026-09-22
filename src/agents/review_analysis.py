@@ -1,7 +1,7 @@
 """Review analysis agent using pgvector retrieval and Gemini."""
 
 import os
-from typing import Optional
+from typing import Optional, Any
 
 import psycopg2
 from dotenv import load_dotenv
